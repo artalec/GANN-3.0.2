@@ -1,0 +1,90 @@
+name: Build GANN Player
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Show toolchain
+        run: |
+          swift --version
+          xcodebuild -version
+
+      - name: Check project layout
+        run: |
+          set -euo pipefail
+          test -f Package.swift || { echo "::error::Package.swift не найден в корне репозитория"; exit 1; }
+          test -d Sources || { echo "::error::Папка Sources не найдена в корне репозитория"; exit 1; }
+          test -f Resources/Info.plist || { echo "::error::Resources/Info.plist не найден"; exit 1; }
+          plutil -lint Resources/Info.plist
+          ls -la
+          ls -la Sources
+
+      - name: Run tests
+        run: swift test --parallel
+
+      - name: Build (release)
+        run: swift build -c release
+
+      - name: Assemble .app bundle
+        run: |
+          set -euo pipefail
+          BIN_DIR="$(swift build -c release --show-bin-path)"
+          BIN="$BIN_DIR/GANNPlayer"
+          test -f "$BIN" || { echo "::error::Бинарник $BIN не найден"; exit 1; }
+
+          APP="GANN Player.app"
+          rm -rf "$APP"
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+          cp "$BIN" "$APP/Contents/MacOS/GANNPlayer"
+          chmod +x "$APP/Contents/MacOS/GANNPlayer"
+          printf 'APPL????' > "$APP/Contents/PkgInfo"
+
+          # Единственный источник Info.plist — файл в репозитории.
+          cp Resources/Info.plist "$APP/Contents/Info.plist"
+
+          # Номер сборки подставляет CI; версия для человека остаётся из plist.
+          BUILD_NUMBER="${GITHUB_RUN_NUMBER:-1}"
+          plutil -replace CFBundleVersion -string "$BUILD_NUMBER" "$APP/Contents/Info.plist"
+
+          # Иконка приложения.
+          if [ -f Resources/AppIcon.icns ]; then
+            cp Resources/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
+          else
+            echo "::warning::Resources/AppIcon.icns не найден — приложение будет без иконки"
+          fi
+
+          # Проверяем, что бандл согласован: имя бинарника, идентификатор, версия.
+          plutil -lint "$APP/Contents/Info.plist"
+          EXEC_NAME="$(plutil -extract CFBundleExecutable raw "$APP/Contents/Info.plist")"
+          test "$EXEC_NAME" = "GANNPlayer" || { echo "::error::CFBundleExecutable=$EXEC_NAME, ожидалось GANNPlayer"; exit 1; }
+          test -f "$APP/Contents/MacOS/$EXEC_NAME" || { echo "::error::Бинарник не совпадает с CFBundleExecutable"; exit 1; }
+          grep -q '<string>14.0</string>' "$APP/Contents/Info.plist" || { echo "::error::LSMinimumSystemVersion не 14.0"; exit 1; }
+          echo "Bundle ID: $(plutil -extract CFBundleIdentifier raw "$APP/Contents/Info.plist")"
+          echo "Version: $(plutil -extract CFBundleShortVersionString raw "$APP/Contents/Info.plist") ($BUILD_NUMBER)"
+
+          codesign --force --deep --sign - "$APP" || echo "::warning::codesign не выполнен"
+
+          ls -laR "$APP/Contents" | head -50
+
+      - name: Archive .app
+        run: |
+          set -euo pipefail
+          ditto -c -k --sequesterRsrc --keepParent "GANN Player.app" "GANN Player.app.zip"
+          ls -lh "GANN Player.app.zip"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: GANN-Player-macOS
+          path: GANN Player.app.zip
+          retention-days: 30
